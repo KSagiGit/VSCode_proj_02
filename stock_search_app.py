@@ -146,6 +146,29 @@ def compute_macd(series):
     return float(macd.iloc[-1])
 
 
+def get_signal_for_stock(stock, history):
+    if history.empty:
+        return "HOLD", "No data available"
+
+    closes = history["Close"].dropna()
+    if len(closes) < 10:
+        return "HOLD", "Not enough data"
+
+    sma5 = compute_sma(closes, 5)
+    sma10 = compute_sma(closes, 10)
+    rsi = compute_rsi(closes, 14)
+    macd = compute_macd(closes)
+
+    if math.isnan(sma5) or math.isnan(sma10):
+        return "HOLD", "Trend not ready"
+
+    if rsi < 35 and closes.iloc[-1] < sma10 and macd < 0:
+        return "BUY", "Oversold + trend support"
+    if rsi > 65 and closes.iloc[-1] > sma10 and macd > 0:
+        return "SELL", "Overbought + momentum risk"
+    return "HOLD", "Mixed trend"
+
+
 class StockApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -237,11 +260,37 @@ class StockApp(tk.Tk):
         overview_title = tk.Label(overview, text="Market Overview", fg="#edf3ff", bg="#0f1a2d", font=("Arial", 16, "bold"), anchor="w")
         overview_title.pack(anchor="w", padx=18, pady=(18, 10))
 
-        self.summary_text = tk.Text(overview, bg="#0f1a2d", fg="#dfeafc", height=18, wrap="word", bd=0, padx=18, pady=10)
+        self.signal_label = tk.Label(overview, text="HOLD", fg="#f9d976", bg="#0f1a2d", font=("Arial", 18, "bold"), anchor="w")
+        self.signal_label.pack(anchor="w", padx=18, pady=(0, 4))
+
+        self.signal_note = tk.Label(overview, text="No signal", fg="#bfd2f3", bg="#0f1a2d", anchor="w")
+        self.signal_note.pack(anchor="w", padx=18, pady=(0, 10))
+
+        self.summary_text = tk.Text(overview, bg="#0f1a2d", fg="#dfeafc", height=14, wrap="word", bd=0, padx=18, pady=10)
         self.summary_text.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self.summary_text.configure(state="disabled")
 
+        watchlist = tk.Frame(right_panel, bg="#0f1a2d", bd=1, relief="flat")
+        watchlist.pack(fill="x", pady=(18, 0))
+
+        watch_title = tk.Label(watchlist, text="Watchlist", fg="#edf3ff", bg="#0f1a2d", font=("Arial", 16, "bold"), anchor="w")
+        watch_title.pack(anchor="w", padx=18, pady=(16, 8))
+
+        self.watchlist_box = tk.Listbox(
+            watchlist,
+            bg="#0f1a2d",
+            fg="#edf3ff",
+            bd=0,
+            highlightthickness=0,
+            activestyle="none",
+            height=8,
+            font=("Arial", 11),
+        )
+        self.watchlist_box.pack(fill="x", padx=12, pady=(0, 12))
+        self.watchlist_box.bind("<<ListboxSelect>>", self.on_watchlist_select)
+
         self.default_suggestions()
+        self.refresh_watchlist()
 
     def default_suggestions(self):
         self.search_var.set("")
@@ -285,6 +334,29 @@ class StockApp(tk.Tk):
         self.draw_chart(stock)
         self.refresh_summary(stock)
 
+    def on_watchlist_select(self, event=None):
+        selection = self.watchlist_box.curselection()
+        if not selection:
+            return
+        item = self.watchlist_box.get(selection[0])
+        symbol = item.split(" ", 1)[0]
+        for stock in STOCKS:
+            if stock["symbol"] == symbol:
+                self.show_stock(stock)
+                return
+
+    def refresh_watchlist(self):
+        self.watchlist_box.delete(0, tk.END)
+        for stock in STOCKS[:8]:
+            live = fetch_stock_data(stock["symbol"])
+            if live:
+                price = live["price"]
+                change = live["change"]
+                color = "#7ef5a8" if change >= 0 else "#ff6b6b"
+                self.watchlist_box.insert(tk.END, f"{stock['symbol']}  ${price:.2f}  {change:+.2f}%")
+            else:
+                self.watchlist_box.insert(tk.END, f"{stock['symbol']}  ${stock['price']:.2f}  {stock['change']:+.2f}%")
+
     def draw_chart(self, stock):
         self.chart_canvas.delete("all")
         width = 300
@@ -294,22 +366,30 @@ class StockApp(tk.Tk):
         self.chart_canvas.create_line(0, center_y, width, center_y, fill="#1f2d40", width=1)
 
         if not self.history_data.empty:
-            closes = self.history_data["Close"].dropna()
-            if len(closes) > 1:
-                values = closes.tail(40).to_numpy()
-                min_v = float(np.min(values))
-                max_v = float(np.max(values))
-                span = max_v - min_v if max_v != min_v else 1.0
-                points = []
-                for i, value in enumerate(values):
-                    x = 10 + i * (width - 20) / max(len(values) - 1, 1)
-                    y = height - 20 - ((value - min_v) / span) * (height - 40)
-                    points.append((x, y))
-                if points:
-                    coords = []
-                    for x, y in points:
-                        coords.extend([x, y])
-                    self.chart_canvas.create_line(coords, fill="#2dd4bf", width=2)
+            candles = self.history_data.tail(20)
+            if not candles.empty:
+                closes = candles["Close"].dropna()
+                highs = candles["High"].dropna()
+                lows = candles["Low"].dropna()
+                opens = candles["Open"].dropna()
+                if len(closes) > 0:
+                    min_v = float(min(lows.min(), closes.min()))
+                    max_v = float(max(highs.max(), closes.max()))
+                    span = max_v - min_v if max_v != min_v else 1.0
+                    for i in range(len(candles)):
+                        x = 15 + i * ((width - 30) / max(len(candles), 1))
+                        open_val = float(opens.iloc[i])
+                        close_val = float(closes.iloc[i])
+                        high_val = float(highs.iloc[i])
+                        low_val = float(lows.iloc[i])
+                        body_top = height - 20 - ((max(open_val, close_val) - min_v) / span) * (height - 40)
+                        body_bottom = height - 20 - ((min(open_val, close_val) - min_v) / span) * (height - 40)
+                        wick_top = height - 20 - ((high_val - min_v) / span) * (height - 40)
+                        wick_bottom = height - 20 - ((low_val - min_v) / span) * (height - 40)
+                        self.chart_canvas.create_line(x, wick_top, x, wick_bottom, fill="#7dd3fc", width=1)
+                        body_height = max(3, abs(body_bottom - body_top))
+                        fill_color = "#2dd4bf" if close_val >= open_val else "#f87171"
+                        self.chart_canvas.create_rectangle(x - 4, body_top, x + 4, body_bottom, fill=fill_color, outline=fill_color)
                     return
 
         points = []
@@ -326,7 +406,11 @@ class StockApp(tk.Tk):
             self.chart_canvas.create_line(coords, fill="#2dd4bf", width=2)
 
     def refresh_summary(self, stock):
-        signal = "Bullish continuation" if stock["change"] >= 0 else "Cautious pullback"
+        signal, signal_note = get_signal_for_stock(stock, self.history_data)
+        signal_color = "#7ef5a8" if signal == "BUY" else "#ff6b6b" if signal == "SELL" else "#f9d976"
+        self.signal_label.config(text=signal, fg=signal_color)
+        self.signal_note.config(text=signal_note)
+
         summary_lines = [
             f"{stock['symbol']} • {stock['name']}",
             f"Sector: {stock['sector']}",
