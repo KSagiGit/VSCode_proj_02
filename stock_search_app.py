@@ -2,6 +2,10 @@ import math
 import tkinter as tk
 from tkinter import ttk
 
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
 
 STOCKS = [
     {"symbol": "AAPL", "name": "Apple Inc.", "sector": "Technology", "price": 214.86, "change": 1.42},
@@ -77,6 +81,71 @@ def suggest_stocks(query, limit=8):
     return [stock for stock, _ in scored[:limit]]
 
 
+def fetch_stock_data(symbol):
+    try:
+        ticker = yf.Ticker(symbol)
+        info = ticker.fast_info or {}
+        history = ticker.history(period="3mo", interval="1d", auto_adjust=True)
+        if history.empty:
+            return None
+
+        close = history["Close"].dropna()
+        if close.empty:
+            return None
+
+        price = float(close.iloc[-1])
+        previous = float(close.iloc[-2]) if len(close) > 1 else price
+        change_pct = ((price - previous) / previous) * 100 if previous else 0.0
+
+        name = ticker.info.get("longName") or symbol
+        sector = ticker.info.get("sector") or "Unknown"
+
+        return {
+            "symbol": symbol,
+            "name": name,
+            "sector": sector,
+            "price": price,
+            "change": change_pct,
+            "history": history,
+        }
+    except Exception:
+        return None
+
+
+def compute_sma(series, window):
+    if len(series) < window:
+        return float("nan")
+    return float(series.rolling(window=window).mean().iloc[-1])
+
+
+def compute_rsi(series, window=14):
+    if len(series) < window + 1:
+        return 50.0
+
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.rolling(window=window).mean().iloc[-1]
+    avg_loss = loss.rolling(window=window).mean().iloc[-1]
+
+    if avg_loss == 0:
+        return 100.0
+
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def compute_macd(series):
+    if len(series) < 26:
+        return 0.0
+
+    ema12 = series.ewm(span=12, adjust=False).mean()
+    ema26 = series.ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    return float(macd.iloc[-1])
+
+
 class StockApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -88,6 +157,7 @@ class StockApp(tk.Tk):
         self.style = ttk.Style(self)
         self.style.theme_use("clam")
 
+        self.history_data = pd.DataFrame()
         self.configure_font()
         self.build_ui()
         self.selected_ticker = "AAPL"
@@ -200,6 +270,11 @@ class StockApp(tk.Tk):
                 return
 
     def show_stock(self, stock):
+        live = fetch_stock_data(stock["symbol"])
+        if live:
+            stock = {**stock, **live}
+        self.history_data = live.get("history", pd.DataFrame()) if live else pd.DataFrame()
+
         self.selected_ticker = stock["symbol"]
         self.search_var.set(f"{stock['symbol']} {stock['name']}")
         self.symbol_label.config(text=stock["symbol"])
@@ -218,6 +293,25 @@ class StockApp(tk.Tk):
 
         self.chart_canvas.create_line(0, center_y, width, center_y, fill="#1f2d40", width=1)
 
+        if not self.history_data.empty:
+            closes = self.history_data["Close"].dropna()
+            if len(closes) > 1:
+                values = closes.tail(40).to_numpy()
+                min_v = float(np.min(values))
+                max_v = float(np.max(values))
+                span = max_v - min_v if max_v != min_v else 1.0
+                points = []
+                for i, value in enumerate(values):
+                    x = 10 + i * (width - 20) / max(len(values) - 1, 1)
+                    y = height - 20 - ((value - min_v) / span) * (height - 40)
+                    points.append((x, y))
+                if points:
+                    coords = []
+                    for x, y in points:
+                        coords.extend([x, y])
+                    self.chart_canvas.create_line(coords, fill="#2dd4bf", width=2)
+                    return
+
         points = []
         for i in range(0, 30):
             x = 10 + i * 9
@@ -232,14 +326,32 @@ class StockApp(tk.Tk):
             self.chart_canvas.create_line(coords, fill="#2dd4bf", width=2)
 
     def refresh_summary(self, stock):
-        summary = (
-            f"{stock['symbol']} • {stock['name']}\n"
-            f"Sector: {stock['sector']}\n\n"
-            f"Price: ${stock['price']:.2f}\n"
-            f"Daily change: {stock['change']:+.2f}%\n\n"
-            f"Signal: Bullish continuation bias. Momentum remains constructive above short-term support.\n"
-            f"Suggested view: trend + RSI confirmation + volume filter."
-        )
+        signal = "Bullish continuation" if stock["change"] >= 0 else "Cautious pullback"
+        summary_lines = [
+            f"{stock['symbol']} • {stock['name']}",
+            f"Sector: {stock['sector']}",
+            f"",
+            f"Price: ${stock['price']:.2f}",
+            f"Daily change: {stock['change']:+.2f}%",
+            f"",
+            f"Signal: {signal}",
+        ]
+
+        if not self.history_data.empty:
+            closes = self.history_data["Close"].dropna()
+            if len(closes) >= 10:
+                sma5 = compute_sma(closes, 5)
+                sma10 = compute_sma(closes, 10)
+                rsi = compute_rsi(closes, 14)
+                macd = compute_macd(closes)
+                summary_lines.extend([
+                    f"SMA(5): ${sma5:.2f}",
+                    f"SMA(10): ${sma10:.2f}",
+                    f"RSI(14): {rsi:.1f}",
+                    f"MACD: {macd:.2f}",
+                ])
+
+        summary = "\n".join(summary_lines)
         self.summary_text.configure(state="normal")
         self.summary_text.delete("1.0", tk.END)
         self.summary_text.insert(tk.END, summary)
